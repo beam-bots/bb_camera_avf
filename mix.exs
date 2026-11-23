@@ -6,7 +6,7 @@ defmodule BB.Camera.AVF.MixProject do
   use Mix.Project
 
   @moduledoc """
-  Beam Bots camera driver for macOS, capturing JPEG via ffmpeg's AVFoundation input.
+  Beam Bots camera driver for macOS, capturing raw frames via ffmpeg's AVFoundation input.
   """
 
   @version "0.1.0"

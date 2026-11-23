@@ -9,7 +9,7 @@ defmodule BB.Camera.AVF.FFmpegTest do
   The stubbed suite proves the driver's behaviour, and `bb_camera_ffmpeg`
   proves that capture under MuonTrap leaves nothing behind. Neither proves that
   the argument vector this driver builds is one ffmpeg accepts and turns into
-  JPEGs. These do, against a synthetic source and against AVFoundation itself.
+  raw frames. These do, against a synthetic source and against AVFoundation itself.
 
   Tagged `:ffmpeg` and excluded by default. Run them with
   `mix test --include ffmpeg`. The `:macos` ones need AVFoundation.
@@ -18,6 +18,7 @@ defmodule BB.Camera.AVF.FFmpegTest do
 
   alias BB.Camera.AVF.Command
   alias BB.Camera.FFmpeg.Capture
+  alias BB.Camera.Frame
 
   @moduletag :ffmpeg
 
@@ -41,7 +42,11 @@ defmodule BB.Camera.AVF.FFmpegTest do
     capture =
       start_supervised!(
         {Capture,
-         executable: command.executable, args: Command.argv(command), notify: test, sink: sink},
+         executable: command.executable,
+         args: Command.argv(command),
+         frame_bytes: command.frame_bytes,
+         notify: test,
+         sink: sink},
         id: :capture,
         restart: :temporary
       )
@@ -51,14 +56,15 @@ defmodule BB.Camera.AVF.FFmpegTest do
     capture
   end
 
-  test "the command produces JPEG frames of the size it asks for" do
+  test "the command produces I420 frames of the size it asks for" do
     start_capture(lavfi: "testsrc2", width: 176, height: 144, frame_rate: 10)
 
     # The bound is an upper limit on an event that must happen, not an
     # estimate of how long ffmpeg takes to start.
     assert_receive {:frame, frame}, 20_000
-    assert {frame.width, frame.height} == {176, 144}
-    assert <<0xFF, 0xD8, _rest::binary>> = frame.data
+
+    assert {:ok, _frame} =
+             Frame.new(format: Command.format(), width: 176, height: 144, data: frame.data)
   end
 
   @tag :macos

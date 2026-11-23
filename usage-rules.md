@@ -8,7 +8,8 @@ SPDX-License-Identifier: Apache-2.0
 
 `bb_camera_avf` provides `BB.Camera.AVF`, a macOS camera driver for
 [Beam Bots](https://hexdocs.pm/bb). It captures through ffmpeg's AVFoundation
-input in a supervised process, encodes to JPEG, and serves frames through
+input in a supervised process, converts every frame to full-range I420 at the
+configured size, and serves raw frames through
 `bb_camera`. For framework basics see `bb`'s rules; for the consumer-facing
 API see `bb_camera`'s. This file covers only what is specific to this driver.
 
@@ -43,7 +44,7 @@ end
 Then consume it through `bb_camera`:
 
 ```elixir
-{:ok, session} = BB.Camera.Media.open(MyRobot, :eye, format: :jpeg)
+{:ok, session} = BB.Camera.Media.open(MyRobot, :eye, format: {:raw, :I420})
 {:ok, frame} = BB.Camera.Media.next(session, 15_000)
 BB.Camera.Media.close(session)
 ```
@@ -61,8 +62,10 @@ and numbers past the last camera are screens. `"default"` means the system's
 default camera.
 
 To see a camera's modes, ask for one it does not have; ffmpeg refuses and
-lists them all. `width`, `height` and `frame_rate` must match one of them.
-`frame_rate: 30` matches a listed `30.000030`.
+lists them all. `width`, `height` and `frame_rate` should match one of them.
+`frame_rate: 30` matches a listed `30.000030`. `width` and `height` must be
+even, because I420 halves both; an odd one is refused with
+`BB.Error.Invalid.Camera.UnsupportedFormat` before capture starts.
 
 ## Camera access
 
@@ -77,15 +80,16 @@ The first capture from a new terminal shows a prompt. Raise
 
 ## What the driver claims to know
 
-- `width` and `height` are read from each JPEG's own frame header. They are
-  what was encoded, which is not always what you asked for.
+- Frames are always `{:raw, :I420}`, full range, at exactly the `width` and
+  `height` you asked for. **If the camera delivers a different size, ffmpeg
+  scales it to the requested one**, aspect ratio and all; the only sign is
+  ffmpeg's warning on the console.
 - `frame_rate` in `stream_info` is the rate that was *asked for*.
   `BB.Camera.Hub` measures what the frames actually did and publishes it in
   `BB.Message.Camera.CaptureState`.
 
 ## Bounds you may need to change
 
-- `:max_frame_bytes` (4 MiB) caps a single frame.
 - `:drop_queue_len` (8) is where frames start being shed.
 - `:stdio_window` (256 KiB) is how much output ffmpeg may have in flight
   before it waits; it bounds what can queue in the VM.

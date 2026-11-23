@@ -16,7 +16,7 @@ ffmpeg's AVFoundation input. One module, `BB.Camera.AVF`, is both a
 `BB.Sensor` and a `BB.Camera`; `BB.Camera.AVF.Command` builds the ffmpeg
 argument vector.
 
-Running ffmpeg, flow control, JPEG framing and process cleanup live in
+Running ffmpeg, flow control, raw video framing and process cleanup live in
 `bb_camera_ffmpeg`, shared with `bb_camera_v4l`. A fix there belongs there,
 not here.
 
@@ -69,17 +69,35 @@ run it from their own terminal.
 channel. `Command.argv/1` always emits it, and `bb_camera_ffmpeg` refuses to
 start ffmpeg without it.
 
-**There is no passthrough.** AVFoundation hands ffmpeg decoded buffers, even
-from a USB webcam that sends MJPEG, so ffmpeg always encodes. Do not
-reintroduce `bb_camera_v4l`'s `-c:v copy` path.
+**Output is forced, never reported.** Every frame goes through
+`-vf scale=W:H:out_range=full,format=yuv420p -f rawvideo`, so the driver
+always delivers full-range `{:raw, :I420}` at exactly the configured size, and
+`Command` computes `frame_bytes` from the same numbers. Raw video doesn't
+describe itself and ffmpeg's stderr isn't read, so forcing is the only way to
+know what is on the pipe. A camera that delivers a different size is scaled,
+not reported. I420 needs even dimensions; `Command.new/1` and
+`stream_info/1` refuse odd ones with `UnsupportedFormat` via
+`BB.Camera.Format.frame_size/3`.
+
+**Never stream-copy the video (`-c:v copy`).** ffmpeg's AVFoundation input
+(read in `libavdevice/avfoundation.m`, not observed) allocates each packet at
+`CVPixelBufferGetDataSize`, which includes row and plane padding, but copies
+the image in tightly packed. A copied packet would carry trailing junk bytes
+onto the pipe and every frame after the first would be cut from the wrong
+place. Decoding through the scale filter re-emits tightly packed frames.
+There is no passthrough to gain anyway: AVFoundation hands ffmpeg decoded
+buffers, even from a webcam that sends MJPEG.
 
 **ffmpeg's default frame rate suits no camera.** It is NTSC's 29.97, which
 cameras tested here do not list, so `-framerate` is always passed. ffmpeg
 matches it against the camera's rates to within 0.01.
 
 **`-fps_mode passthrough`, never `-r`.** A camera that slows down in low light
-should produce fewer frames. `-r` makes ffmpeg duplicate them up to the
-requested rate and encode every copy.
+should produce fewer frames. The rawvideo muxer carries no timestamps, and for
+such a muxer ffmpeg's default is a constant rate: without the flag it
+duplicates frames up to the stream's nominal rate, and so does `-r`. Measured
+with ffmpeg 7.1 against a lavfi source with a gap in its timestamps: 30 frames
+out for 10 in by default, 10 with `passthrough`.
 
 **Camera names have ffmpeg's sharp edges.** ffmpeg splits its input on `:`,
 treats a name beginning `none` as no video and one beginning `default` as the
@@ -112,10 +130,11 @@ the hub has an event for saying so.
 
 ## Honesty about what is known
 
-The driver reports dimensions parsed from each frame's own `SOF` marker. That
-matters here: when AVFoundation refuses ffmpeg's configuration, ffmpeg warns
-`Configuration of video device failed, falling back to default` and captures
-at the camera's default size.
+The driver reports the format and size it forced, which are the ones in the
+DSL. When AVFoundation refuses ffmpeg's configuration, ffmpeg warns
+`Configuration of video device failed, falling back to default` on the console
+and captures at the camera's default size, and the scale filter then resizes
+every frame to the requested one. Nothing in the VM sees that happen.
 
 The frame rate in `stream_info` is only ever the one that was *asked for*.
 The hub measures the real rate; this driver should not.
@@ -129,11 +148,21 @@ opens nothing and needs no camera access. Finding modes means asking ffmpeg to
 open the camera, which does, and which turns a quick look into a permission
 prompt.
 
+## Open risks
+
+**The shedding threshold was measured with MJPEG.** On macOS MuonTrap
+forwards output in 4 KiB reads, so one raw 1280x720 I420 frame (1,382,400
+bytes) arrives as about 340 reads, against a handful for the JPEG it
+replaced. `bb_camera_ffmpeg`'s `:drop_queue_len` of 8 counts waiting reads,
+and was measured on a Mac when frames were MJPEG. It needs measuring again on
+a Mac with raw frames before anyone trusts it; it has not been changed here.
+
 ## Testing
 
 The test robot declares `BB.Camera.FFmpeg.Test.StubBackend` as its backend,
-and tests feed it images from `BB.Camera.FFmpeg.Test.JpegBuilder`. Both ship
-in `bb_camera_ffmpeg`'s `lib` for exactly this.
+and tests feed it raw bytes of exactly one I420 frame's size
+(`BB.Camera.Format.frame_size/3`). The stub ships in `bb_camera_ffmpeg`'s
+`lib` for exactly this.
 
 **No test sleeps, and no timed negative assertions.** To show something did
 not happen, push a call through the process first and then use
@@ -146,7 +175,7 @@ other systems by `test/test_helper.exs`.
 
 - `bb` — the framework
 - `bb_camera` — the `BB.Camera` behaviour, hub, frame and error types
-- `bb_camera_ffmpeg` — ffmpeg under MuonTrap, flow control and JPEG framing
+- `bb_camera_ffmpeg` — ffmpeg under MuonTrap, flow control and raw video framing
 
 ## Licensing headers
 

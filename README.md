@@ -16,8 +16,8 @@ SPDX-License-Identifier: Apache-2.0
 [![Ask DeepWiki](https://deepwiki.com/badge.svg)](https://deepwiki.com/beam-bots/bb_camera_avf)
 
 A [Beam Bots](https://github.com/beam-bots/bb) camera driver for macOS —
-built-in FaceTime cameras, USB webcams, Continuity Camera — capturing JPEG
-through ffmpeg's AVFoundation input in a supervised process.
+built-in FaceTime cameras, USB webcams, Continuity Camera — capturing raw
+I420 frames through ffmpeg's AVFoundation input in a supervised process.
 
 It exists mostly so that a robot developed on a Mac can see through a real
 camera before it is deployed to Linux, where
@@ -116,7 +116,7 @@ BB_VERSION=local iex -S mix
 runs, not stored in the lockfile.
 
 Paste this robot into the session. It captures one of ffmpeg's own synthetic
-sources: real ffmpeg, real JPEG encoder, real pipe, real framing — and no
+sources: real ffmpeg, real scale filter, real pipe, real framing — and no
 hardware.
 
 ```elixir
@@ -136,18 +136,23 @@ end
 
 {:ok, _pid} = SynthCam.start_link([])
 
-{:ok, session} = BB.Camera.Media.open(SynthCam, :eye, format: :jpeg)
+{:ok, session} = BB.Camera.Media.open(SynthCam, :eye, format: {:raw, :I420})
 {:ok, frame} = BB.Camera.Media.next(session, 10_000)
 
-{frame.width, frame.height, byte_size(frame.data)}
-#=> {320, 240, 8620}
+{frame.format, frame.width, frame.height, byte_size(frame.data)}
+#=> {{:raw, :I420}, 320, 240, 115200}
 
-File.write!("/tmp/frame.jpg", frame.data)
+File.write!("/tmp/frame.yuv", frame.data)
 BB.Camera.Media.close(session)
 ```
 
+The frame is raw full-range I420, so ffmpeg is what turns it into something
+you can look at:
+
 ```sh
-open /tmp/frame.jpg
+ffmpeg -f rawvideo -pixel_format yuv420p -color_range pc -video_size 320x240 \
+  -i /tmp/frame.yuv /tmp/frame.png
+open /tmp/frame.png
 ```
 
 If that failed, nothing below will work, and the problem is ffmpeg rather than
@@ -223,19 +228,22 @@ end
 
 BB.subscribe(MyCam, [:sensor, :head, :eye])
 
-{:ok, session} = BB.Camera.Media.open(MyCam, :eye, format: :jpeg)
+{:ok, session} = BB.Camera.Media.open(MyCam, :eye, format: {:raw, :I420})
 {:ok, frame} = BB.Camera.Media.next(session, 15_000)
 {frame.width, frame.height}
-File.write!("/tmp/camera.jpg", frame.data)
+File.write!("/tmp/camera.yuv", frame.data)
 ```
 
 If `next/2` returns `CaptureFailed` with `{:no_frames, 10000}`, see
 [Camera access](#camera-access).
 
-`frame.width` and `frame.height` are read out of the JPEG that was actually
-encoded. If ffmpeg could not configure the camera as asked, it says
-`Configuration of video device failed, falling back to default` and captures
-at the camera's default size instead; this is where you find out.
+`frame.width` and `frame.height` are always the size you asked for, because
+ffmpeg scales every frame to it. **If the camera delivers a different size,
+ffmpeg scales it to the requested one** — stretching it if the aspect ratio
+differs. When ffmpeg cannot configure the camera as asked it prints
+`Configuration of video device failed, falling back to default` on the
+console and captures at the camera's default size; the console is the only
+place that shows up.
 
 ### 5. Shut it down
 
@@ -254,7 +262,7 @@ goes out.
 ## A preview in a browser
 
 `bb_liveview` mounts a dashboard that previews any camera a robot declares,
-this one included, as MJPEG. Declare the camera in your robot and point the
+this one included. Declare the camera in your robot and point the
 dashboard at it; there is nothing driver-specific to wire up.
 
 ## Options
@@ -263,13 +271,11 @@ dashboard at it; there is nothing driver-specific to wire up.
 |---|---|---|
 | `:device` | — | Camera name, `"default"`, or index. Required unless `:lavfi` is given |
 | `:lavfi` | — | An ffmpeg synthetic source such as `"testsrc2"`, instead of a camera |
-| `:width`, `:height` | `640`, `480` | Must be a size the camera lists |
+| `:width`, `:height` | `640`, `480` | Asked of the camera and scaled to. Must be even |
 | `:frame_rate` | `30` | A hertz unit, a number, or `{numerator, denominator}` |
-| `:input_format` | `:nv12` | Pixel format to ask AVFoundation for |
-| `:quality` | `5` | ffmpeg's `-q:v`, 1 (best) to 31 |
+| `:input_format` | `:nv12` | Pixel format to ask AVFoundation for; converted to I420 |
 | `:ffmpeg` | `$PATH` | Path to the ffmpeg executable |
 | `:start_timeout_ms` | `10000` | Fail capture when no frame has arrived by then |
-| `:max_frame_bytes` | 4 MiB | Largest frame accepted before the stream is resynchronised |
 | `:drop_queue_len` | `8` | Shed frames while more reads than this are waiting |
 | `:stdio_window` | 256 KiB | Bytes of output ffmpeg may have in flight unacknowledged |
 | `:stop_timeout_ms` | `2000` | How long ffmpeg gets after `SIGTERM` before `SIGKILL` |
@@ -287,21 +293,23 @@ MuonTrap ──> ffmpeg ──pipe──> Capture ──frames──> BB.Camera.
 - **[`bb_camera_ffmpeg`](https://github.com/beam-bots/bb_camera_ffmpeg)** does
   the rest, shared with `bb_camera_v4l`: it runs ffmpeg under MuonTrap, so
   ffmpeg cannot outlive the capture or the VM; it flow-controls ffmpeg's
-  output; it frames the JPEG stream structurally; and it holds the first frame
+  output; it cuts the raw video into frames by size; and it holds the first frame
   until the hub has been told capture started.
 
 ## Limitations
 
 - **macOS only.**
-- **Every frame is encoded by ffmpeg.** AVFoundation hands over decoded
-  buffers, even from a webcam that sends MJPEG, so there is no passthrough.
+- **Every frame goes through ffmpeg's scale filter.** Output is always
+  full-range I420 at exactly `:width` x `:height`, whatever the camera
+  delivers, so a camera that ignores the requested size is scaled rather than
+  reported. Both dimensions must be even.
 - **Cameras are chosen by name or index.** ffmpeg 9.0 cannot select one by
   its unique ID, so two identical webcams cannot be told apart.
 - **Camera access is the app's, not the VM's**, and a missing grant looks
   exactly like a camera that sends nothing. See
   [Camera access](#camera-access).
 - **Timestamps are arrival times, not exposure times, and are not suitable for
-  synchronisation.** The MJPEG stream ffmpeg writes has no container and no
+  synchronisation.** The raw video ffmpeg writes has no container and no
   timestamps; a frame is stamped when the read completing it reached the
   BEAM.
 - **The frame rate is reported as requested, not negotiated.** What the frames
@@ -313,8 +321,8 @@ MuonTrap ──> ffmpeg ──pipe──> Capture ──frames──> BB.Camera.
 - **Changing an option that reaches ffmpeg restarts it**, with `EndCapture`
   and `BeginCapture` around the change.
 - **ffmpeg's diagnostics go to the VM's console**, not into the error.
-- **JPEG only.** Interframe codecs are refused rather than carried; see
-  `bb_camera` for why.
+- **I420 only.** `bb_camera` carries raw frames, and this driver always
+  writes I420.
 
 ## Testing
 

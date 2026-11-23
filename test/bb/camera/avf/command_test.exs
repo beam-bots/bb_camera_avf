@@ -7,6 +7,7 @@ defmodule BB.Camera.AVF.CommandTest do
   use ExUnit.Case, async: true
 
   alias BB.Camera.AVF.Command
+  alias BB.Error.Invalid.Camera.UnsupportedFormat
 
   doctest BB.Camera.AVF.Command
 
@@ -24,15 +25,28 @@ defmodule BB.Camera.AVF.CommandTest do
   end
 
   describe "new/1" do
-    test "accepts arbitrary positive dimensions" do
-      assert {:ok, command} = Command.new(options(width: 1, height: 1))
-      assert {command.width, command.height} == {1, 1}
+    test "accepts arbitrary positive even dimensions" do
+      assert {:ok, command} = Command.new(options(width: 2, height: 2))
+      assert {command.width, command.height} == {2, 2}
 
       assert {:ok, command} = Command.new(options(width: 3840, height: 2160))
       assert {command.width, command.height} == {3840, 2160}
 
-      assert {:ok, command} = Command.new(options(width: 1234, height: 567))
-      assert "1234x567" in Command.argv(command)
+      assert {:ok, command} = Command.new(options(width: 1234, height: 566))
+      assert "1234x566" in Command.argv(command)
+    end
+
+    test "rejects odd dimensions, which I420 cannot take" do
+      assert {:error, %UnsupportedFormat{reason: :invalid_dimensions, width: 641}} =
+               Command.new(options(width: 641))
+
+      assert {:error, %UnsupportedFormat{reason: :invalid_dimensions, height: 481}} =
+               Command.new(options(height: 481))
+    end
+
+    test "knows the size of one frame of what it writes" do
+      assert {:ok, command} = Command.new(options(width: 1280, height: 720))
+      assert command.frame_bytes == div(1280 * 720 * 3, 2)
     end
 
     test "rejects dimensions that are not positive integers" do
@@ -102,20 +116,22 @@ defmodule BB.Camera.AVF.CommandTest do
         assert {:ok, _command} = Command.new(options(input_format: format))
       end
     end
-
-    test "rejects a quality outside ffmpeg's range" do
-      assert {:error, {:invalid_quality, 0}} = Command.new(options(quality: 0))
-      assert {:error, {:invalid_quality, 32}} = Command.new(options(quality: 32))
-    end
   end
 
   describe "argv/1" do
-    test "always encodes, because AVFoundation hands over decoded buffers" do
-      {:ok, command} = Command.new(options(input_format: :uyvy422, quality: 7))
+    test "forces full-range I420 at the requested size, whatever the camera delivers" do
+      {:ok, command} = Command.new(options(input_format: :uyvy422, width: 1280, height: 720))
 
       assert argv_pair(command, "-pixel_format") == "uyvy422"
-      assert argv_pair(command, "-c:v") == "mjpeg"
-      assert argv_pair(command, "-q:v") == "7"
+      assert argv_pair(command, "-vf") == "scale=1280:720:out_range=full,format=yuv420p"
+      assert Command.format() == {:raw, :I420}
+    end
+
+    test "never stream-copies, which would put AVFoundation's padding on the pipe" do
+      {:ok, command} = Command.new(options())
+
+      refute "-c:v" in Command.argv(command)
+      refute "copy" in Command.argv(command)
     end
 
     test "asks for nv12 unless told otherwise" do
@@ -144,6 +160,14 @@ defmodule BB.Camera.AVF.CommandTest do
 
       assert List.last(argv) == "pipe:1"
       assert argv_pair(command, "-f") == "avfoundation"
+
+      output_format =
+        argv
+        |> Enum.chunk_every(2, 1, :discard)
+        |> Enum.filter(&match?(["-f", _format], &1))
+        |> List.last()
+
+      assert output_format == ["-f", "rawvideo"]
     end
 
     test "never produces an argument that is not a plain string" do

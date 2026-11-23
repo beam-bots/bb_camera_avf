@@ -21,10 +21,16 @@ defmodule BB.Camera.AVF do
 
   ## What it captures
 
-  JPEG, encoded by ffmpeg. AVFoundation hands ffmpeg decoded buffers even from
-  a USB webcam that sends MJPEG, so there is no passthrough path: every frame
-  costs an encode. `:input_format` chooses which pixel format AVFoundation is
-  asked for, and `:quality` the encoder's trade between size and fidelity.
+  Raw frames: full-range I420 (`{:raw, :I420}`) at exactly `:width` x
+  `:height`. `:input_format` chooses which pixel format AVFoundation is asked
+  for, and ffmpeg's scale filter converts it to I420 at the configured size.
+  Both dimensions must be even, since I420 halves them for its chroma planes;
+  an odd one is refused with `BB.Error.Invalid.Camera.UnsupportedFormat` before
+  anything starts.
+
+  **If the camera delivers a different size than requested, ffmpeg scales it
+  to the requested size.** See `BB.Camera.AVF.Command` for why the output is
+  forced rather than reported.
 
   ## Camera access
 
@@ -42,15 +48,14 @@ defmodule BB.Camera.AVF do
 
   ## What it reports
 
-  Capture is confirmed to the hub on the **first whole image**, not when ffmpeg
+  Capture is confirmed to the hub on the **first whole frame**, not when ffmpeg
   starts. `Port.open/2` returning says only that ffmpeg exists — a missing
   camera would otherwise announce `BeginCapture` a moment before failing.
 
-  Dimensions come from the `SOF` marker of each frame, which is what was
-  actually encoded. They are not always the numbers in the DSL: when
-  AVFoundation refuses ffmpeg's configuration, ffmpeg warns and captures in
-  the camera's default format instead, and `BB.Camera.stream_info/2` reports
-  the real size.
+  The format and dimensions it reports are the ones ffmpeg is forced to write,
+  which are the ones in the DSL. When AVFoundation refuses ffmpeg's
+  configuration, ffmpeg warns on the console and captures at the camera's
+  default size, and the frames are scaled; nothing here can see that happen.
 
   The frame rate in `stream_info` is the one that was **requested**, not the
   negotiated one. This driver does not query the device's rate back and does
@@ -86,7 +91,7 @@ defmodule BB.Camera.AVF do
     tests run anywhere, against a synthetic source.
   - **Cameras are chosen by name or index**, not by unique ID; see
     `BB.Camera.AVF.Command`.
-  - **Timestamps are arrival times.** The raw MJPEG stream carries no
+  - **Timestamps are arrival times.** The raw video stream carries no
     timestamps of its own, so a frame is stamped when the read completing it
     reached the BEAM. See `BB.Camera.FFmpeg.Capture` for what that does and
     does not mean.
@@ -132,7 +137,7 @@ defmodule BB.Camera.AVF do
         required: false,
         doc: """
         An ffmpeg synthetic source such as `"testsrc2"` to capture instead of a
-        device. Runs the whole real pipeline — real ffmpeg, real encoder, real
+        device. Runs the whole real pipeline — real ffmpeg, real filter, real
         pipe, real framing — with no hardware, which is how you tell a broken
         camera from a broken setup. Not a substitute for `BB.Camera.Synthetic`,
         which needs no ffmpeg at all.
@@ -141,12 +146,12 @@ defmodule BB.Camera.AVF do
       width: [
         type: :pos_integer,
         default: 640,
-        doc: "Width in pixels to ask the device for"
+        doc: "Width in pixels to ask the device for, and to scale frames to. Must be even"
       ],
       height: [
         type: :pos_integer,
         default: 480,
-        doc: "Height in pixels to ask the device for"
+        doc: "Height in pixels to ask the device for, and to scale frames to. Must be even"
       ],
       frame_rate: [
         type: FrameRate.option_type(),
@@ -156,12 +161,7 @@ defmodule BB.Camera.AVF do
       input_format: [
         type: {:or, [:atom, :string]},
         default: :nv12,
-        doc: "Pixel format to ask AVFoundation for. ffmpeg always encodes it to JPEG"
-      ],
-      quality: [
-        type: :pos_integer,
-        default: 5,
-        doc: "ffmpeg's `-q:v`, 1 (best) to 31"
+        doc: "Pixel format to ask AVFoundation for. ffmpeg always converts it to I420"
       ],
       start_timeout_ms: [
         type: :pos_integer,
@@ -181,11 +181,6 @@ defmodule BB.Camera.AVF do
         type: unit_type(compatible: :hertz),
         default: ~u(1 hertz),
         doc: "How often the hub publishes `BB.Message.Camera.CaptureState`"
-      ],
-      max_frame_bytes: [
-        type: :pos_integer,
-        default: 4 * 1024 * 1024,
-        doc: "Largest frame to accept. See `BB.Camera.FFmpeg.Framer`"
       ],
       drop_queue_len: [
         type: :pos_integer,
@@ -220,12 +215,13 @@ defmodule BB.Camera.AVF do
   end
 
   @doc """
-  The format this camera is declared to produce.
+  The format this camera produces.
 
   Pure: it is called during discovery against robots that are not running, so
   it reads the options and nothing else. Options that still hold unresolved
   parameter references cannot imply a format, and produce an error rather than
-  a guess.
+  a guess. Odd dimensions, which I420 cannot take, are refused with
+  `BB.Error.Invalid.Camera.UnsupportedFormat`.
   """
   @impl BB.Camera
   def stream_info(opts) do
@@ -233,11 +229,10 @@ defmodule BB.Camera.AVF do
          {:ok, height} <- fetch_dimension(opts, :height),
          {:ok, frame_rate} <- fetch_frame_rate(opts) do
       StreamInfo.new(
-        format: :jpeg,
+        format: Command.format(),
         width: width,
         height: height,
-        frame_rate: frame_rate,
-        metadata: %{pixel_format: nil}
+        frame_rate: frame_rate
       )
     end
   end
@@ -265,7 +260,6 @@ defmodule BB.Camera.AVF do
          bb: opts[:bb],
          capture: nil,
          command: command,
-         dimensions: nil,
          hub: hub,
          opts: opts,
          pending: nil,
@@ -284,8 +278,8 @@ defmodule BB.Camera.AVF do
   def handle_info({:bb_camera, :stop_capture}, state),
     do: {:noreply, request_stop(state, :driver_stopped)}
 
-  def handle_info({:bb_camera_ffmpeg, capture, {:ready, info}}, %{capture: capture} = state),
-    do: {:noreply, confirm(state, info)}
+  def handle_info({:bb_camera_ffmpeg, capture, :ready}, %{capture: capture} = state),
+    do: {:noreply, confirm(state)}
 
   def handle_info({:bb_camera_ffmpeg, capture, event}, %{capture: capture} = state),
     do: {:noreply, handle_capture_event(state, event)}
@@ -305,7 +299,7 @@ defmodule BB.Camera.AVF do
 
     Hub.capture_failed(state.hub, %CaptureFailed{camera: camera_name(state), reason: reason})
 
-    {:noreply, run_pending(%{state | capture: nil, dimensions: nil})}
+    {:noreply, run_pending(%{state | capture: nil})}
   end
 
   def handle_info(_message, state), do: {:noreply, state}
@@ -401,7 +395,7 @@ defmodule BB.Camera.AVF do
 
     Capture.stop(capture)
 
-    %{state | capture: nil, dimensions: nil, stopping: capture, pending: pending}
+    %{state | capture: nil, stopping: capture, pending: pending}
   end
 
   defp queue(state, pending), do: %{state | pending: pending}
@@ -449,23 +443,21 @@ defmodule BB.Camera.AVF do
 
   defp start_capture(state) do
     hub = state.hub
-
-    # The dimensions the hub has been told about, shared between this process
-    # and the capture process that writes them.
-    dimensions = :atomics.new(2, signed: false)
+    stream_info = state.stream_info
 
     opts =
       [
         args: Command.argv(state.command),
         executable: state.command.executable,
+        frame_bytes: state.command.frame_bytes,
         notify: self(),
         sequence_start: state.sequence,
-        sink: fn frame -> deliver(hub, state.stream_info, dimensions, frame) end
+        sink: fn frame -> deliver(hub, stream_info, frame) end
       ] ++ Keyword.take(state.opts, capture_option_keys())
 
     case Capture.start_link(opts) do
       {:ok, capture} ->
-        %{state | capture: capture, dimensions: dimensions}
+        %{state | capture: capture}
 
       {:error, reason} ->
         Hub.capture_failed(state.hub, %CaptureFailed{
@@ -477,47 +469,28 @@ defmodule BB.Camera.AVF do
     end
   end
 
-  # Capture is confirmed on the first whole image, not when ffmpeg starts.
+  # Capture is confirmed on the first whole frame, not when ffmpeg starts.
   # `Port.open/2` returning tells us ffmpeg exists; it says nothing about
   # whether the device opened, and a missing camera would otherwise announce
   # `BeginCapture` a moment before it failed.
-  defp confirm(state, info) do
-    stream_info = %{
-      state.stream_info
-      | width: info.width,
-        height: info.height,
-        metadata: Map.put(state.stream_info.metadata, :pixel_format, info.chroma_format)
-    }
-
-    :atomics.put(state.dimensions, 1, info.width)
-    :atomics.put(state.dimensions, 2, info.height)
-
-    Hub.capture_started(state.hub, stream_info)
+  defp confirm(state) do
+    Hub.capture_started(state.hub, state.stream_info)
     Capture.go(state.capture)
 
-    %{state | stream_info: stream_info}
+    state
   end
 
-  defp deliver(hub, declared, dimensions, frame) do
-    known = {:atomics.get(dimensions, 1), :atomics.get(dimensions, 2)}
-
-    if {frame.width, frame.height} != known do
-      Hub.update_stream_info(hub, %{declared | width: frame.width, height: frame.height})
-      :atomics.put(dimensions, 1, frame.width)
-      :atomics.put(dimensions, 2, frame.height)
-    end
-
+  defp deliver(hub, stream_info, frame) do
     Hub.deliver(
       hub,
       Frame.new!(
-        format: :jpeg,
-        width: frame.width,
-        height: frame.height,
+        format: stream_info.format,
+        width: stream_info.width,
+        height: stream_info.height,
         data: frame.data,
         sequence: frame.sequence,
         monotonic_time: frame.monotonic_time,
-        wall_time: frame.wall_time,
-        metadata: frame.metadata
+        wall_time: frame.wall_time
       )
     )
   end
@@ -534,14 +507,6 @@ defmodule BB.Camera.AVF do
     is camera access: check System Settings > Privacy & Security > Camera for the app that \
     started this VM.\
     """)
-
-    state
-  end
-
-  defp handle_capture_event(state, {:discarded, bytes, reason}) do
-    Logger.warning(
-      "#{inspect(camera_name(state))} discarded #{bytes} bytes of capture: #{reason}"
-    )
 
     state
   end
@@ -577,7 +542,7 @@ defmodule BB.Camera.AVF do
   defp build_command(opts) do
     command_opts =
       opts
-      |> Keyword.take([:device, :lavfi, :width, :height, :frame_rate, :input_format, :quality])
+      |> Keyword.take([:device, :lavfi, :width, :height, :frame_rate, :input_format])
       |> Keyword.put(:executable, opts[:ffmpeg])
 
     case Command.new(command_opts) do
@@ -591,7 +556,6 @@ defmodule BB.Camera.AVF do
       :backend,
       :backend_opts,
       :drop_queue_len,
-      :max_frame_bytes,
       :start_timeout_ms,
       :stdio_window,
       :stop_timeout_ms
