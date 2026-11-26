@@ -39,32 +39,54 @@ defmodule BB.Camera.AVF.Command do
   Newer ffmpeg can select a camera by its unique ID. 9.0 cannot, so neither
   can this driver.
 
-  ## Always encoding
+  ## Always decoding, always scaling
 
   AVFoundation hands ffmpeg decompressed buffers, even from a USB camera that
-  sends MJPEG over the wire. There is no passthrough path here: every frame is
-  encoded to JPEG by ffmpeg, and `:quality` always matters. This is the
-  expensive path that `bb_camera_v4l` treats as a fallback. On a laptop it is
-  affordable; it is still real CPU per frame.
+  sends MJPEG over the wire, and the hub carries raw frames only. So every frame
+  goes through ffmpeg's scale filter on its way out:
+  `-vf scale=W:H:out_range=full,format=yuv420p -f rawvideo`, which writes
+  full-range I420 at exactly `:width` x `:height`.
+
+  That is forced rather than requested because raw video doesn't describe
+  itself: ffmpeg's console output isn't read, so nothing could say what it
+  produced if it were left to choose. It has two consequences worth knowing:
+
+  - **A camera that delivers a different size is scaled to the requested
+    one.** When AVFoundation refuses ffmpeg's configuration, ffmpeg warns and
+    captures at the camera's default size; the filter then resizes every frame
+    to the size that was asked for, aspect ratio and all.
+  - **The video is never stream-copied.** ffmpeg's AVFoundation input
+    allocates each packet at the pixel buffer's padded size but copies the
+    image in tightly packed, so `-c:v copy` would put trailing junk bytes on
+    the pipe after every frame. The scale filter re-emits tightly packed
+    frames.
+
+  `:input_format` still matters: it is what AVFoundation is asked to deliver,
+  and so what the filter converts from.
 
   ## Frame timing
 
   ffmpeg is told not to change the frame rate on the way out
-  (`-fps_mode passthrough`). A camera that slows down in low light should
-  produce fewer frames, not have ffmpeg duplicate them up to the requested
-  rate and encode each copy.
+  (`-fps_mode passthrough`). The raw video muxer carries no timestamps, and for
+  such a muxer ffmpeg's default is a constant rate: a camera that slows down
+  in low light would have its frames duplicated up to the requested rate,
+  rather than producing fewer.
   """
 
   alias BB.Camera.FFmpeg.FrameRate
+  alias BB.Camera.Format
+  alias BB.Error.Invalid.Camera.UnsupportedFormat
 
-  defstruct [:source, :width, :height, :frame_rate, :input_format, :quality, :executable]
+  @format {:raw, :I420}
+
+  defstruct [:source, :width, :height, :frame_rate, :input_format, :frame_bytes, :executable]
 
   @typedoc """
   Where the frames come from.
 
   `{:device, name}` and `{:device, index}` are a real camera. `{:lavfi, filter}`
-  is one of ffmpeg's own synthetic sources, which produces a genuine MJPEG
-  stream through the real encoder and the real pipe without any hardware —
+  is one of ffmpeg's own synthetic sources, which produces genuine raw video
+  through the real filter and the real pipe without any hardware —
   useful for proving the pipeline works before blaming the camera.
   """
   @type source ::
@@ -76,7 +98,7 @@ defmodule BB.Camera.AVF.Command do
           height: pos_integer(),
           frame_rate: FrameRate.t(),
           input_format: String.t(),
-          quality: pos_integer(),
+          frame_bytes: pos_integer(),
           executable: String.t()
         }
 
@@ -85,10 +107,10 @@ defmodule BB.Camera.AVF.Command do
           | {:invalid_dimension, term()}
           | {:invalid_frame_rate, term()}
           | {:invalid_input_format, term()}
-          | {:invalid_quality, term()}
           | {:invalid_lavfi_source, term()}
           | {:no_source, term()}
           | {:ffmpeg_not_found, term()}
+          | UnsupportedFormat.t()
 
   @format_pattern ~r/\A[a-z0-9_]+\z/
 
@@ -104,17 +126,17 @@ defmodule BB.Camera.AVF.Command do
     instead of a device. Only the bare filter name is accepted; the size and
     rate are filled in from `:width`, `:height` and `:frame_rate`, so there is
     one source of truth for them and no filtergraph to get wrong.
-  - `:width`, `:height` — any positive pixel dimensions. ffmpeg refuses a size
-    the camera does not list, and prints the list when it does.
+  - `:width`, `:height` — positive, even pixel dimensions; I420 halves both
+    for its chroma planes, so an odd one is refused with
+    `BB.Error.Invalid.Camera.UnsupportedFormat`. AVFoundation is asked for
+    this size, and the output is scaled to it whatever the camera delivers.
   - `:frame_rate` — see `BB.Camera.FFmpeg.FrameRate`. ffmpeg matches it against
     the camera's own rates to within 0.01, so `30` selects a camera's
     `30.000030`.
   - `:input_format` — the pixel format to ask AVFoundation for, as ffmpeg names
-    it. Default `"nv12"`, which is already 4:2:0 and is the cheapest to hand
-    the JPEG encoder. A camera that lacks it gets its first listed format
-    instead, with a warning from ffmpeg.
-  - `:quality` — ffmpeg's `-q:v` for the MJPEG encoder, 1 (best) to 31.
-    Default `5`.
+    it. Default `"nv12"`, which is already 4:2:0 and the cheapest to convert
+    to I420. A camera that lacks it gets its first listed format instead, with
+    a warning from ffmpeg.
   - `:executable` — path to ffmpeg. Defaults to whatever is on `$PATH`.
   """
   @spec new(keyword()) :: {:ok, t()} | {:error, error()}
@@ -124,7 +146,7 @@ defmodule BB.Camera.AVF.Command do
          {:ok, height} <- validate_dimension(Keyword.get(opts, :height)),
          {:ok, frame_rate} <- validate_frame_rate(Keyword.get(opts, :frame_rate)),
          {:ok, input_format} <- validate_input_format(Keyword.get(opts, :input_format, "nv12")),
-         {:ok, quality} <- validate_quality(Keyword.get(opts, :quality, 5)),
+         {:ok, frame_bytes} <- Format.frame_size(@format, width, height),
          {:ok, executable} <- validate_executable(Keyword.get(opts, :executable)) do
       {:ok,
        %__MODULE__{
@@ -133,11 +155,17 @@ defmodule BB.Camera.AVF.Command do
          height: height,
          frame_rate: frame_rate,
          input_format: input_format,
-         quality: quality,
+         frame_bytes: frame_bytes,
          executable: executable
        }}
     end
   end
+
+  @doc """
+  The format every command writes: full-range I420.
+  """
+  @spec format() :: Format.t()
+  def format, do: @format
 
   @doc """
   The argument vector, without the executable itself.
@@ -148,16 +176,18 @@ defmodule BB.Camera.AVF.Command do
       iex> BB.Camera.AVF.Command.argv(command)
       ["-nostdin", "-hide_banner", "-loglevel", "error", "-f", "avfoundation",
        "-pixel_format", "nv12", "-video_size", "1280x720", "-framerate", "30",
-       "-i", "FaceTime HD Camera", "-an", "-c:v", "mjpeg", "-q:v", "5",
-       "-fps_mode", "passthrough", "-f", "mjpeg", "-flush_packets", "1", "pipe:1"]
+       "-i", "FaceTime HD Camera", "-an", "-vf",
+       "scale=1280:720:out_range=full,format=yuv420p", "-fps_mode", "passthrough",
+       "-f", "rawvideo", "-flush_packets", "1", "pipe:1"]
 
       iex> {:ok, command} = BB.Camera.AVF.Command.new(
       ...>   lavfi: "testsrc2", width: 320, height: 240,
       ...>   frame_rate: 10, executable: "/opt/homebrew/bin/ffmpeg")
       iex> BB.Camera.AVF.Command.argv(command)
       ["-nostdin", "-hide_banner", "-loglevel", "error", "-re", "-f", "lavfi", "-i",
-       "testsrc2=size=320x240:rate=10", "-an", "-c:v", "mjpeg", "-q:v", "5",
-       "-fps_mode", "passthrough", "-f", "mjpeg", "-flush_packets", "1", "pipe:1"]
+       "testsrc2=size=320x240:rate=10", "-an", "-vf",
+       "scale=320:240:out_range=full,format=yuv420p", "-fps_mode", "passthrough",
+       "-f", "rawvideo", "-flush_packets", "1", "pipe:1"]
   """
   @spec argv(t()) :: [String.t()]
   def argv(%__MODULE__{} = command) do
@@ -170,14 +200,12 @@ defmodule BB.Camera.AVF.Command do
       input_argv(command) ++
       [
         "-an",
-        "-c:v",
-        "mjpeg",
-        "-q:v",
-        Integer.to_string(command.quality),
+        "-vf",
+        "scale=#{command.width}:#{command.height}:out_range=full,format=yuv420p",
         "-fps_mode",
         "passthrough",
         "-f",
-        "mjpeg",
+        "rawvideo",
         "-flush_packets",
         "1",
         "pipe:1"
@@ -207,7 +235,7 @@ defmodule BB.Camera.AVF.Command do
         ":rate=#{FrameRate.to_string(command.frame_rate)}"
 
     # A synthetic source has no hardware pacing it, so without `-re` ffmpeg
-    # generates frames as fast as it can encode them - thousands a second, and
+    # generates frames as fast as it can filter them - thousands a second, and
     # nothing like the camera it is standing in for.
     ["-re", "-f", "lavfi", "-i", graph]
   end
@@ -269,9 +297,6 @@ defmodule BB.Camera.AVF.Command do
   end
 
   defp validate_input_format(value), do: {:error, {:invalid_input_format, value}}
-
-  defp validate_quality(value) when is_integer(value) and value in 1..31, do: {:ok, value}
-  defp validate_quality(value), do: {:error, {:invalid_quality, value}}
 
   defp validate_executable(nil) do
     case System.find_executable("ffmpeg") do
